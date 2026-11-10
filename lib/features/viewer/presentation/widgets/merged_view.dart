@@ -1,0 +1,534 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../../core/constants/app_colors.dart';
+import '../../../diff/domain/diff_entry.dart';
+import '../../../diff/domain/diff_operation.dart';
+import '../../../diff/domain/diff_result.dart';
+import 'inline_char_diff.dart';
+import '../line_height_calculator.dart';
+import '../viewer_widgets.dart';
+
+class MergedView extends ConsumerWidget {
+  const MergedView({
+    required this.result,
+    required this.heightTable,
+    this.controller,
+    this.lineNumbers = true,
+    this.findQuery = '',
+    this.currentMatchEntry,
+    this.showLineNumbers = true,
+    this.bodyFontSize = 14.0,
+    this.gutterFontSize = 11.0,
+    this.noWrap = false,
+    this.jumpedToEntry,
+    this.onLongPressEntry,
+    super.key,
+  });
+
+  final DiffResult result;
+  final LineHeightTable heightTable;
+  final ScrollController? controller;
+  final bool lineNumbers;
+  final String findQuery;
+  final int? currentMatchEntry;
+  final bool showLineNumbers;
+  final double bodyFontSize;
+  final double gutterFontSize;
+  final bool noWrap;
+  final int? jumpedToEntry;
+  final void Function(int entryIndex)? onLongPressEntry;
+
+  static const Color _matchYellow = Color(0xFFFFF59D);
+  static const Color _matchPink = Color(0xFFFF4081);
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final meta = cachedMergedMeta(result);
+    final order = cachedMergedOrder(result);
+    final pairs = cachedMergedPairs(result);
+
+    return buildViewerScrollbar(
+      controller: controller,
+      child: ListView.builder(
+        controller: controller,
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        itemCount: order.length,
+        addAutomaticKeepAlives: false,
+        addRepaintBoundaries: false,
+        cacheExtent: 100,
+        itemExtentBuilder: (index, dimensions) {
+          return heightTable.heightOf(index);
+        },
+        itemBuilder: (ctx, i) {
+          final ei = order[i];
+          final e = result.entries[ei];
+          final isCurrent =
+              currentMatchEntry != null && ei == currentMatchEntry;
+          final tile = _EntryTile(
+            entry: e,
+            pairedText: pairs[ei],
+            lineNumber: lineNumbers ? meta[ei].orig : 0,
+            findQuery: findQuery,
+            isCurrentMatch: isCurrent,
+            matchYellow: _matchYellow,
+            matchPink: _matchPink,
+            showLineNumbers: showLineNumbers,
+            bodyFontSize: bodyFontSize,
+            gutterFontSize: gutterFontSize,
+            noWrap: noWrap,
+          );
+          final wrapped = onLongPressEntry == null
+              ? tile
+              : GestureDetector(
+                  onLongPress: () => onLongPressEntry!(ei),
+                  behavior: HitTestBehavior.opaque,
+                  child: tile,
+                );
+          final Widget framed = (jumpedToEntry == ei)
+              ? Container(
+                  foregroundDecoration: BoxDecoration(
+                    border: Border.all(color: Colors.black, width: 2),
+                  ),
+                  child: wrapped,
+                )
+              : wrapped;
+          return KeyedSubtree(key: ValueKey<int>(ei), child: framed);
+        },
+      ),
+    );
+  }
+}
+
+// ========== 派生数据缓存 ==========
+
+DiffResult? _lastMergedMetaFor;
+List<({int orig, int mod})>? _lastMergedMeta;
+
+List<({int orig, int mod})> cachedMergedMeta(DiffResult result) {
+  if (identical(_lastMergedMetaFor, result) && _lastMergedMeta != null) {
+    return _lastMergedMeta!;
+  }
+  final meta = <({int orig, int mod})>[];
+  var o = 0, m = 0;
+  for (final e in result.entries) {
+    meta.add((orig: o, mod: m));
+    if (e.operation == DiffOperation.equal ||
+        e.operation == DiffOperation.delete) o++;
+    if (e.operation == DiffOperation.equal ||
+        e.operation == DiffOperation.insert) m++;
+  }
+  _lastMergedMeta = meta;
+  _lastMergedMetaFor = result;
+  return meta;
+}
+
+DiffResult? _lastMergedOrderFor;
+List<int>? _lastMergedOrder;
+
+List<int> cachedMergedOrder(DiffResult result) {
+  if (identical(_lastMergedOrderFor, result) && _lastMergedOrder != null) {
+    return _lastMergedOrder!;
+  }
+  _lastMergedOrder = _mergedOrder(result.entries);
+  _lastMergedOrderFor = result;
+  return _lastMergedOrder!;
+}
+
+List<int> _mergedOrder(List<DiffEntry> entries) {
+  final order = <int>[];
+  var i = 0;
+  while (i < entries.length) {
+    final e = entries[i];
+    if (e.operation == DiffOperation.delete ||
+        e.operation == DiffOperation.insert) {
+      final delStart = i;
+      while (i < entries.length &&
+          entries[i].operation == DiffOperation.delete) {
+        i++;
+      }
+      final delEnd = i;
+      final insStart = i;
+      while (i < entries.length &&
+          entries[i].operation == DiffOperation.insert) {
+        i++;
+      }
+      final insEnd = i;
+
+      final delCount = delEnd - delStart;
+      final insCount = insEnd - insStart;
+      final pairs = delCount < insCount ? delCount : insCount;
+
+      for (var k = 0; k < pairs; k++) {
+        order.add(delStart + k);
+        order.add(insStart + k);
+      }
+      for (var k = pairs; k < delCount; k++) {
+        order.add(delStart + k);
+      }
+      for (var k = pairs; k < insCount; k++) {
+        order.add(insStart + k);
+      }
+    } else {
+      order.add(i);
+      i++;
+    }
+  }
+  return order;
+}
+
+/// entry 索引 → 配对的对侧文本。只有 (del, ins) 成对出现的那种 entry
+/// 才在 map 里。用来让行内字符高亮知道"对面长什么样"。
+DiffResult? _lastMergedPairsFor;
+Map<int, String>? _lastMergedPairs;
+
+Map<int, String> cachedMergedPairs(DiffResult result) {
+  if (identical(_lastMergedPairsFor, result) && _lastMergedPairs != null) {
+    return _lastMergedPairs!;
+  }
+  final map = <int, String>{};
+  final entries = result.entries;
+  var i = 0;
+  while (i < entries.length) {
+    final e = entries[i];
+    if (e.operation == DiffOperation.delete ||
+        e.operation == DiffOperation.insert) {
+      final delStart = i;
+      while (i < entries.length &&
+          entries[i].operation == DiffOperation.delete) {
+        i++;
+      }
+      final delEnd = i;
+      final insStart = i;
+      while (i < entries.length &&
+          entries[i].operation == DiffOperation.insert) {
+        i++;
+      }
+      final insEnd = i;
+
+      final delCount = delEnd - delStart;
+      final insCount = insEnd - insStart;
+      final pairs = delCount < insCount ? delCount : insCount;
+
+      for (var k = 0; k < pairs; k++) {
+        map[delStart + k] = entries[insStart + k].text;
+        map[insStart + k] = entries[delStart + k].text;
+      }
+    } else {
+      i++;
+    }
+  }
+  _lastMergedPairs = map;
+  _lastMergedPairsFor = result;
+  return map;
+}
+
+// ========== 查找高亮 spans 的 LRU 缓存 ==========
+
+const int _spansCacheCap = 512;
+final Map<String, List<InlineSpan>> _spansCache =
+    <String, List<InlineSpan>>{};
+
+List<InlineSpan> _cachedSpans(
+  String text,
+  String findQuery,
+  bool isCurrentMatch,
+  Color matchYellow,
+  Color matchPink,
+) {
+  final key = '$text\u0000$findQuery\u0000${isCurrentMatch ? 1 : 0}';
+  final hit = _spansCache[key];
+  if (hit != null) return hit;
+
+  final spans =
+      _buildSpans(text, findQuery, isCurrentMatch, matchYellow, matchPink);
+  if (_spansCache.length >= _spansCacheCap) {
+    _spansCache.clear();
+  }
+  _spansCache[key] = spans;
+  return spans;
+}
+
+List<InlineSpan> _buildSpans(
+  String text,
+  String findQuery,
+  bool isCurrentMatch,
+  Color matchYellow,
+  Color matchPink,
+) {
+  final q = findQuery;
+  if (q.isEmpty || text.isEmpty) {
+    return <InlineSpan>[TextSpan(text: text)];
+  }
+  final bg = isCurrentMatch ? matchPink : matchYellow;
+  final spans = <InlineSpan>[];
+  var start = 0;
+  int idx;
+  while (start <= text.length && (idx = text.indexOf(q, start)) != -1) {
+    if (idx > start) spans.add(TextSpan(text: text.substring(start, idx)));
+    spans.add(TextSpan(
+      text: q,
+      style: TextStyle(backgroundColor: bg, fontWeight: FontWeight.bold),
+    ));
+    start = idx + q.length;
+  }
+  if (start < text.length) spans.add(TextSpan(text: text.substring(start)));
+  return spans.isEmpty ? <InlineSpan>[TextSpan(text: text)] : spans;
+}
+
+class _EntryTile extends StatelessWidget {
+  const _EntryTile({
+    required this.entry,
+    required this.pairedText,
+    required this.lineNumber,
+    required this.findQuery,
+    required this.isCurrentMatch,
+    required this.matchYellow,
+    required this.matchPink,
+    required this.showLineNumbers,
+    required this.bodyFontSize,
+    required this.gutterFontSize,
+    required this.noWrap,
+  });
+
+  final DiffEntry entry;
+  final String? pairedText;
+  final int lineNumber;
+  final String findQuery;
+  final bool isCurrentMatch;
+  final Color matchYellow;
+  final Color matchPink;
+  final bool showLineNumbers;
+  final double bodyFontSize;
+  final double gutterFontSize;
+  final bool noWrap;
+
+  @override
+  Widget build(BuildContext context) {
+    final defaultFg = Theme.of(context).textTheme.bodyMedium?.color;
+    final outline = Theme.of(context).colorScheme.outline;
+
+    // 被改行（有配对）：用"浅色 + 行内字符差异"
+    // 纯增/纯删（无配对）：用"整行纯色"
+    final bool isReplace =
+        pairedText != null && pairedText!.isNotEmpty;
+
+    final Widget row = switch (entry.operation) {
+      DiffOperation.equal => _plain(
+          context,
+          text: entry.text,
+          color: defaultFg,
+        ),
+      DiffOperation.insert => isReplace
+          ? _replaceRow(
+              context,
+              before: pairedText!,
+              after: entry.text,
+              isLeft: false,
+            )
+          : _highlighted(
+              context,
+              text: entry.text,
+              color: AppColors.addedOf(context),
+              fgColor: const Color(0xFF066F00), // 新增，深绿
+              symbol: '+',
+            ),
+      DiffOperation.delete => isReplace
+          ? _replaceRow(
+              context,
+              before: entry.text,
+              after: pairedText!,
+              isLeft: true,
+            )
+          : _highlighted(
+              context,
+              text: entry.text,
+              color: AppColors.deletedOf(context),
+              fgColor: const Color(0xFF6F0000), // 删除，深红
+              symbol: '-',
+            ),
+      DiffOperation.replace => _replaceRow(
+          context,
+          before: entry.oldText.isEmpty ? entry.text : entry.oldText,
+          after: entry.newText.isEmpty ? entry.text : entry.newText,
+          isLeft: true,
+        ),
+    };
+
+    if (!showLineNumbers || lineNumber <= 0) return row;
+
+    return Row(
+      // 行号(小号字)与正文(大号字)字号不同，改用基线对齐，让行号与正文第一行共基线。
+      crossAxisAlignment: CrossAxisAlignment.baseline,
+      textBaseline: TextBaseline.alphabetic,
+      children: [
+        SizedBox(
+          width: 30,
+          child: Padding(
+            // 改用基线对齐后，原来的 top:6 手动下移已无需保留，否则会把行号顶出这一行顶部。
+            padding: const EdgeInsets.only(right: 4),
+            child: Text(
+              '$lineNumber',
+              textAlign: TextAlign.end,
+              style: TextStyle(fontSize: gutterFontSize, color: outline),
+            ),
+          ),
+        ),
+        Expanded(child: row),
+      ],
+    );
+  }
+
+  /// 被改行：浅色背景 + 行内字符差异。
+  Widget _replaceRow(
+    BuildContext context, {
+    required String before,
+    required String after,
+    required bool isLeft,
+  }) {
+    final style = TextStyle(
+      fontSize: bodyFontSize,
+      color: isLeft
+          ? const Color(0xFF6F0000) // 改行（左）文字：深红
+          : const Color(0xFF066F00), // 改行（右）文字：深绿
+      height: 1.5,
+    );
+
+    final content = InlineCharDiff(
+      before: before,
+      after: after,
+      side: !isLeft,
+      style: style,
+      findQuery: findQuery,
+      isCurrentMatch: isCurrentMatch,
+      removedFg: Colors.white,
+      removedBg: const Color(0xFFD32F2F),
+      addedFg: Colors.white,
+      addedBg: const Color(0xFF388E3C),
+    );
+
+    final barColor = isLeft
+        ? AppColors.deletedOf(context)
+        : AppColors.addedOf(context);
+
+    return Padding(
+      padding: const EdgeInsets.only(right: 2, top: 1, bottom: 6),
+      child: ColoredBox(
+        color: barColor.withValues(alpha: 0.07),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Container(width: 3, color: barColor),
+            const SizedBox(width: 4),
+            if (showLineNumbers)
+              Padding(
+                padding: const EdgeInsets.only(top: 3),
+                child: Text(
+                  '~',
+                  style: TextStyle(
+                    color: barColor,
+                    fontWeight: FontWeight.bold,
+                    fontSize: bodyFontSize,
+                  ),
+                ),
+              ),
+            const SizedBox(width: 4),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: content,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _plain(BuildContext context, {required String text, Color? color}) {
+    final style = TextStyle(
+      fontSize: bodyFontSize,
+      color: color,
+      height: 1.5,
+    );
+    final spans = findQuery.isEmpty
+        ? <InlineSpan>[TextSpan(text: text.isEmpty ? ' ' : text)]
+        : _cachedSpans(
+            text, findQuery, isCurrentMatch, matchYellow, matchPink);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      child: noWrap
+          ? Text.rich(
+              TextSpan(style: style, children: spans),
+              softWrap: false,
+              overflow: TextOverflow.clip,
+              maxLines: 1,
+            )
+          : Text.rich(TextSpan(style: style, children: spans)),
+    );
+  }
+
+  Widget _highlighted(
+    BuildContext context, {
+    required String text,
+    required Color color, // 背景 / 竖条 / 符号色
+    required Color fgColor, // 文字颜色
+    required String symbol,
+  }) {
+    final style = TextStyle(
+      fontSize: bodyFontSize,
+      color: fgColor,
+      height: 1.5,
+    );
+
+    final content = noWrap
+        ? Text.rich(
+            TextSpan(
+              style: style,
+              children: _cachedSpans(
+                  text, findQuery, isCurrentMatch, matchYellow, matchPink),
+            ),
+            softWrap: false,
+            overflow: TextOverflow.clip,
+            maxLines: 1,
+          )
+        : Text.rich(TextSpan(
+            style: style,
+            children: _cachedSpans(
+                text, findQuery, isCurrentMatch, matchYellow, matchPink),
+          ));
+
+    return Padding(
+      padding: const EdgeInsets.only(right: 2, top: 1, bottom: 6),
+      child: ColoredBox(
+        color: color.withValues(alpha: 0.18),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Container(width: 3, color: color),
+            const SizedBox(width: 4),
+            if (showLineNumbers && symbol.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 3),
+                child: Text(
+                  symbol,
+                  style: TextStyle(
+                    color: color,
+                    fontWeight: FontWeight.bold,
+                    fontSize: bodyFontSize,
+                  ),
+                ),
+              ),
+            const SizedBox(width: 4),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: content,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 柔光渐变底：白 → 浅蓝 → 白。仅作底色，图标交给 Flutter 的 AppSplash，
+         避免在 Android ≤11 上再由系统画一个大图标，造成“双启动页”。 -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="315"
+                android:startColor="@color/splash_start"
+                android:centerColor="@color/splash_center"
+                android:endColor="@color/splash_end"
+                android:type="linear" />
+        </shape>
+    </item>
+</layer-list>

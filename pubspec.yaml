@@ -1,0 +1,78 @@
+name: docdiff
+description: Mobile lightweight document diff tool.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: '>=3.10.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations: 
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+  permission_handler: ^11.3.1
+  shared_preferences: ^2.3.2
+  flutter_colorpicker: ^1.1.0
+  scrollable_positioned_list: ^0.3.8
+  open_filex: ^4.5.0
+  flutter_markdown: ^0.7.4+3
+
+  # State management
+  flutter_riverpod: ^2.4.0
+  riverpod_annotation: ^2.3.0
+
+  # File picker + cloud
+  file_picker: ^13.1.0
+
+  # Document parsing
+  archive: ^3.4.0      # zip decode for OOXML (.docx) container
+  xml: ^6.3.0          # parse word/document.xml
+  # pdfrx: ^1.0.0      # pdf rendering (P1)
+
+  # OCR (P1)
+  # google_mlkit_text_recognition: ^0.11.0
+
+  # Diff core
+  diff_match_patch: ^0.4.1
+
+  # JS engine（规则里跑 JavaScript）
+  flutter_js: ^0.8.2
+
+  # Utils
+  path: ^1.8.3
+  path_provider: ^2.1.4
+  collection: ^1.18.0
+  url_launcher: ^6.2.1
+  share_plus: ^13.0.0
+  enough_convert: ^1.6.0
+  charset: ^2.0.1
+  gbk_codec: ^0.4.0
+  crypto: ^3.0.0             # MD5 对比
+
+  # 全文编辑器（全文单框编辑，替代 TextField）
+  # 用项目内的副本：只为了打一个补丁——选区变化不再触发整屏段落重排
+  # （拖选区手柄卡顿的根因），见 packages/re_editor/PATCH.md
+  re_editor:
+    path: packages/re_editor
+
+# 锁死这个 Android 实现，防止 CI 自动拉到 2.5.0 导致白屏
+dependency_overrides:
+  shared_preferences_android: 2.4.28
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  riverpod_generator: ^2.3.0
+  build_runner: ^2.4.0
+  mocktail: ^1.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/t2s.txt
+    - assets/images/app_icon.png
+    - assets/images/dupebox_icon.png

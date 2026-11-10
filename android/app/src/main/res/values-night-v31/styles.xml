@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Android 12+ 系统闪屏（深色）：底色调成 #121212 与 Flutter 深色
+         渐变边缘一致，图标透明，避免系统大图标闪一下造成“双启动页”。 -->
+    <style name="LaunchTheme" parent="@android:style/Theme.Black.NoTitleBar">
+        <item name="android:windowBackground">@color/splash_solid</item>
+        <item name="android:windowSplashScreenBackground">@color/splash_solid</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/transparent_splash</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@color/splash_solid</item>
+    </style>
+</resources>

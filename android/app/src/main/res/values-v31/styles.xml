@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Android 12+ 系统闪屏：只支持纯色底 + 居中图标 -->
+    <!-- 把图标换成透明图、底色用与 Flutter 渐变边缘一致的 #F5FAFF，
+         系统闪屏就只剩一层浅色底、不再显示大图标，
+         视觉上只有 Flutter 的 AppSplash(渐变+小图标+阴影) 才是启动页。 -->
+    <style name="LaunchTheme" parent="@android:style/Theme.Light.NoTitleBar">
+        <item name="android:windowBackground">@color/splash_solid</item>
+        <item name="android:windowSplashScreenBackground">@color/splash_solid</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/transparent_splash</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@color/splash_solid</item>
+    </style>
+</resources>

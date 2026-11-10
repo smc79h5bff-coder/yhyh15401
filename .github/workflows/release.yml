@@ -1,0 +1,81 @@
+name: 构建发布
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '版本号，比如 v1.0.0'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: 校验签名文件
+        run: |
+          if [ ! -f android/app/release.jks ]; then
+            echo "错误：缺少 android/app/release.jks 签名文件，请先把正确的 release.jks 提交到仓库后再构建。"
+            exit 1
+          fi
+
+      - name: 清理 + 拉依赖
+        run: |
+          flutter clean
+          flutter pub get
+
+      - name: 补全并提交 pubspec.lock（锁死依赖版本）
+        run: |
+          git config user.name "actions"
+          git config user.email "actions@github.com"
+          git add -f pubspec.lock
+          git diff --staged --quiet || git commit -m "chore: 补全 pubspec.lock [skip ci]"
+          git diff --staged --quiet || git push origin HEAD
+
+      # 按 ABI 分包：每个 flavor 出 3 个包（armeabi-v7a / arm64-v8a / x86_64），
+      # 单个包只带一份原生库，体积约为通用包的 1/3。用户按手机架构下载对应包。
+      - run: flutter build apk --release --split-per-abi --flavor prod --dart-define=APP_NAME=TxTdiff
+      - run: flutter build apk --release --split-per-abi --flavor coexist --dart-define=APP_NAME=TXTcompare
+
+      - name: 整理
+        run: |
+          mkdir -p out
+          for f in build/app/outputs/flutter-apk/app-prod-*.apk; do
+            [ -e "$f" ] || continue
+            abi=$(basename "$f" | grep -oE 'armeabi-v7a|arm64-v8a|x86_64' || true)
+            cp "$f" "out/TxTdiff-${abi:-universal}.apk"
+          done
+          for f in build/app/outputs/flutter-apk/app-coexist-*.apk; do
+            [ -e "$f" ] || continue
+            abi=$(basename "$f" | grep -oE 'armeabi-v7a|arm64-v8a|x86_64' || true)
+            cp "$f" "out/TXTcompare-${abi:-universal}.apk"
+          done
+          ls -lh out
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.tag }}
+          body: |
+            按 CPU 架构分包，请按手机选择：
+            - 绝大多数手机（64 位）：下载 `arm64-v8a`
+            - 老旧 32 位手机：下载 `armeabi-v7a`
+            - 模拟器：下载 `x86_64`
+
+            TxTdiff：arm64-v8a / armeabi-v7a / x86_64
+            TXTcompare：arm64-v8a / armeabi-v7a / x86_64
+          files: out/*.apk

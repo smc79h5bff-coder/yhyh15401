@@ -1,0 +1,3 @@
+# 这是 vendored 的第三方包（re_editor 0.10.0），保持它原本的风格，
+# 不套用主项目的 strict-casts / strict-inference 和 lint 规则。
+# 本包相对上游唯一的改动见 PATCH.md。

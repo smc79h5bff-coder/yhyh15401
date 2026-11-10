@@ -1,0 +1,350 @@
+/// 规则类型。决定这条规则走哪条执行路径。
+enum RuleKind {
+  /// 查找替换（7 开关 + 正则/字面）。
+  replace,
+
+  /// 预置功能。用 presetId 选功能，params 传参数。
+  preset,
+
+  /// JS 脚本。用 jsScript 里的 JS 代码处理文本。
+  js,
+
+  /// 规则表：引用内置表（正则/普通文字/水印）和/或内嵌自定义表，
+  /// 点击时按序执行删除/替换。只在编辑器的自定义工具按钮里可建。
+  table,
+}
+
+extension RuleKindX on RuleKind {
+  String get label => switch (this) {
+        RuleKind.replace => '查找替换',
+        RuleKind.preset => '预置功能',
+        RuleKind.js => 'JS 脚本',
+        RuleKind.table => '规则表',
+      };
+}
+
+/// 内嵌在规则里的自定义表（仅 kind == table 且引用了自定义表时有值）。
+///
+/// 和内置三表不同：它不进「对比规则设置」页，只随规则存在，
+/// 只能在工具按钮的新建/编辑流程里编辑。按"普通文字"语义执行（删除或替换）。
+class CustomTable {
+  const CustomTable({required this.name, required this.content});
+
+  /// 表名，仅用于按钮/详情里显示。
+  final String name;
+
+  /// 多行规则文本，每行一条，格式：查找词->=>替换词；省略 ->=> 则整行命中即删除。
+  final String content;
+
+  CustomTable copyWith({String? name, String? content}) =>
+      CustomTable(name: name ?? this.name, content: content ?? this.content);
+
+  Map<String, dynamic> toJson() => {'name': name, 'content': content};
+
+  factory CustomTable.fromJson(Map<String, dynamic> j) => CustomTable(
+        name: j['name'] as String? ?? '',
+        content: j['content'] as String? ?? '',
+      );
+}
+
+/// 把规则表引用翻译成显示名：内置表用固定名，自定义表用其 name。
+String tableRefLabel(String ref, Map<String, CustomTable> custom) {
+  switch (ref) {
+    case 'regex':
+      return '正则表';
+    case 'keyword':
+      return '普通文字表';
+    case 'watermark':
+      return '水印表';
+    default:
+      if (ref.startsWith('custom_')) {
+        final t = custom[ref];
+        return t != null && t.name.isNotEmpty ? t.name : '自定义表';
+      }
+      return ref;
+  }
+}
+
+/// One find/replace rule applied before diff.
+class PreprocessingRule {
+  const PreprocessingRule({
+    required this.id,
+    required this.name,
+    this.kind = RuleKind.replace,
+    this.findPattern = '',
+    this.replaceWith = '',
+    this.scope = RuleScope.both,
+    this.enabled = true,
+    this.isBuiltin = false,
+    this.script,
+    // ====== 查找侧 3 开关 ======
+    this.findRegex = true,
+    this.findLiteral = false,
+    this.findEscape = false,
+    // ====== 替换侧 4 开关 ======
+    this.replaceDollar = true,
+    this.replaceBackslash = false,
+    this.replaceLiteral = false,
+    this.replaceEscape = false,
+    // ====== preset 用 ======
+    this.presetId,
+    this.params = const {},
+    // ====== js 用 ======
+    this.jsScript,
+    // ====== 实现方式 / 替代方案（内置规则和预置功能用，用户建的不用） ======
+    this.implType,
+    this.implDetail,
+    this.replacementType,
+    this.replacementDetail,
+    this.replacementNote,
+    // ====== 详细说明（长按弹窗里显示） ======
+    this.helpText,
+    // ====== 规则表用 ======
+    this.tables = const [],
+    this.customTables = const {},
+  });
+
+  final String id;
+  final String name;
+
+  /// 规则类型。老数据缺这个字段时按 replace 处理。
+  final RuleKind kind;
+
+  final String findPattern;
+  final String replaceWith;
+  final RuleScope scope;
+  final bool enabled;
+  final bool isBuiltin;
+
+  /// 特殊脚本标识。仅用于内置规则（lowercase / dropEmptyLines / unifyAnsi）。
+  /// kind == replace 且非空时，优先走内置脚本。
+  final String? script;
+
+  /// 是否脚本型内置规则。UI 层（列表副标题 / 详情弹窗）据此不显示脚本文本。
+  bool get isScriptRule => script != null && script!.isNotEmpty;
+
+  // ==================== 7 个处理开关（kind == replace 时用） ====================
+
+  final bool findRegex;
+  final bool findLiteral;
+  final bool findEscape;
+  final bool replaceDollar;
+  final bool replaceBackslash;
+  final bool replaceLiteral;
+  final bool replaceEscape;
+
+  // ==================== preset 用 ====================
+
+  /// 预置功能 ID。kind == preset 时非空。
+  /// 例如 'lineFilter'、'trimLines'、'removeEmptyLines'。
+  final String? presetId;
+
+  /// 预置功能的参数。key 和含义由 presetId 对应的实现决定。
+  final Map<String, String> params;
+
+  // ==================== js 用 ====================
+
+  /// JS 脚本源码。kind == js 时非空。
+  /// 脚本约定：最后表达式的值作为处理结果；text 是输入文本变量。
+  final String? jsScript;
+
+  // ==================== 实现方式 / 替代方案 ====================
+
+  /// 实现方式类型。'正则' 或 '代码'。
+  /// null 表示不显示"实现方式"块。
+  final String? implType;
+
+  /// 实现方式详情。
+  /// implType == '正则' 时，存正则表达式原文（比如 r'\r\n|\r'）。
+  /// implType == '代码' 时，存关键代码片段（比如 'text.toLowerCase()'）。
+  final String? implDetail;
+
+  /// 替代方案状态。'ok' / 'warn' / 'impossible'。
+  /// null 表示不显示"替代方案"块。
+  final String? replacementType;
+
+  /// 替代方案详情。
+  /// - 'ok'：存替代正则 + 性能说明
+  /// - 'warn'：存原因 + "不建议"
+  /// - 'impossible'：存"为什么不能用正则替代"
+  final String? replacementDetail;
+
+  /// 替代方案额外备注（可选）。
+  final String? replacementNote;
+
+  // ==================== 详细说明 ====================
+
+  /// 详细说明（大段文字，长按弹窗里显示）。
+  /// 内置规则和预置功能都会填；用户自建规则一般为 null。
+  final String? helpText;
+
+  // ==================== 规则表用（kind == table） ====================
+
+  /// 勾选的规则表，按执行顺序排列。
+  /// 元素取值：'regex' | 'keyword' | 'watermark' | 'custom_<id>'。
+  final List<String> tables;
+
+  /// 内嵌的自定义表，key 与 tables 里的 'custom_<id>' 对应。
+  final Map<String, CustomTable> customTables;
+
+  PreprocessingRule copyWith({
+    String? name,
+    RuleKind? kind,
+    String? findPattern,
+    String? replaceWith,
+    RuleScope? scope,
+    bool? enabled,
+    String? script,
+    bool? findRegex,
+    bool? findLiteral,
+    bool? findEscape,
+    bool? replaceDollar,
+    bool? replaceBackslash,
+    bool? replaceLiteral,
+    bool? replaceEscape,
+    String? presetId,
+    Map<String, String>? params,
+    String? jsScript,
+    String? implType,
+    String? implDetail,
+    String? replacementType,
+    String? replacementDetail,
+    String? replacementNote,
+    String? helpText,
+    List<String>? tables,
+    Map<String, CustomTable>? customTables,
+  }) =>
+      PreprocessingRule(
+        id: id,
+        name: name ?? this.name,
+        kind: kind ?? this.kind,
+        findPattern: findPattern ?? this.findPattern,
+        replaceWith: replaceWith ?? this.replaceWith,
+        scope: scope ?? this.scope,
+        enabled: enabled ?? this.enabled,
+        isBuiltin: isBuiltin,
+        script: script ?? this.script,
+        findRegex: findRegex ?? this.findRegex,
+        findLiteral: findLiteral ?? this.findLiteral,
+        findEscape: findEscape ?? this.findEscape,
+        replaceDollar: replaceDollar ?? this.replaceDollar,
+        replaceBackslash: replaceBackslash ?? this.replaceBackslash,
+        replaceLiteral: replaceLiteral ?? this.replaceLiteral,
+        replaceEscape: replaceEscape ?? this.replaceEscape,
+        presetId: presetId ?? this.presetId,
+        params: params ?? this.params,
+        jsScript: jsScript ?? this.jsScript,
+        implType: implType ?? this.implType,
+        implDetail: implDetail ?? this.implDetail,
+        replacementType: replacementType ?? this.replacementType,
+        replacementDetail: replacementDetail ?? this.replacementDetail,
+        replacementNote: replacementNote ?? this.replacementNote,
+        helpText: helpText ?? this.helpText,
+        tables: tables ?? this.tables,
+        customTables: customTables ?? this.customTables,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'kind': kind.name,
+        'findPattern': findPattern,
+        'replaceWith': replaceWith,
+        'scope': scope.name,
+        'enabled': enabled,
+        'isBuiltin': isBuiltin,
+        if (script != null) 'script': script,
+        'findRegex': findRegex,
+        'findLiteral': findLiteral,
+        'findEscape': findEscape,
+        'replaceDollar': replaceDollar,
+        'replaceBackslash': replaceBackslash,
+        'replaceLiteral': replaceLiteral,
+        'replaceEscape': replaceEscape,
+        if (presetId != null) 'presetId': presetId,
+        if (params.isNotEmpty) 'params': params,
+        if (jsScript != null) 'jsScript': jsScript,
+        if (implType != null) 'implType': implType,
+        if (implDetail != null) 'implDetail': implDetail,
+        if (replacementType != null) 'replacementType': replacementType,
+        if (replacementDetail != null)
+          'replacementDetail': replacementDetail,
+        if (replacementNote != null) 'replacementNote': replacementNote,
+        if (helpText != null) 'helpText': helpText,
+        'tables': tables,
+        if (customTables.isNotEmpty)
+          'customTables':
+              customTables.map((k, v) => MapEntry(k, v.toJson())),
+      };
+
+  factory PreprocessingRule.fromJson(Map<String, dynamic> j) {
+    // 兼容旧字段名。
+    final oldReplaceRegex = j['replaceRegex'] as bool?;
+    final oldFindDollar = j['findDollar'] as bool?;
+
+    // 老数据没有 kind 字段。有 script 或 findPattern 非空 → replace。
+    RuleKind kind;
+    final kindName = j['kind'] as String?;
+    if (kindName != null) {
+      kind = RuleKind.values.firstWhere(
+        (k) => k.name == kindName,
+        orElse: () => RuleKind.replace,
+      );
+    } else {
+      kind = RuleKind.replace;
+    }
+
+    // params：JSON 里是 Map<String, dynamic>，转成 Map<String, String>。
+    Map<String, String> params = const {};
+    final rawParams = j['params'];
+    if (rawParams is Map) {
+      params = {
+        for (final e in rawParams.entries)
+          e.key.toString(): e.value?.toString() ?? '',
+      };
+    }
+
+    return PreprocessingRule(
+      id: j['id'] as String,
+      name: j['name'] as String,
+      kind: kind,
+      findPattern: j['findPattern'] as String? ?? '',
+      replaceWith: j['replaceWith'] as String? ?? '',
+      scope: RuleScope.values.firstWhere(
+        (s) => s.name == j['scope'],
+        orElse: () => RuleScope.both,
+      ),
+      enabled: j['enabled'] as bool? ?? true,
+      isBuiltin: j['isBuiltin'] as bool? ?? false,
+      script: j['script'] as String?,
+      findRegex: j['findRegex'] as bool? ?? true,
+      findLiteral: j['findLiteral'] as bool? ?? false,
+      findEscape: j['findEscape'] as bool? ?? false,
+      replaceDollar: j['replaceDollar'] as bool? ?? true,
+      replaceBackslash:
+          j['replaceBackslash'] as bool? ?? oldReplaceRegex ?? false,
+      replaceLiteral: j['replaceLiteral'] as bool? ?? false,
+      replaceEscape: j['replaceEscape'] as bool? ?? false,
+      presetId: j['presetId'] as String?,
+      params: params,
+      jsScript: j['jsScript'] as String?,
+      implType: j['implType'] as String?,
+      implDetail: j['implDetail'] as String?,
+      replacementType: j['replacementType'] as String?,
+      replacementDetail: j['replacementDetail'] as String?,
+      replacementNote: j['replacementNote'] as String?,
+      helpText: j['helpText'] as String?,
+      tables: (j['tables'] as List?)?.map((e) => e as String).toList() ??
+          const <String>[],
+      customTables: (j['customTables'] as Map?)?.map(
+            (k, v) => MapEntry(
+              k as String,
+              CustomTable.fromJson(v as Map<String, dynamic>),
+            ),
+          ) ??
+          const <String, CustomTable>{},
+    );
+  }
+}
+
+enum RuleScope { both, originalOnly, modifiedOnly }

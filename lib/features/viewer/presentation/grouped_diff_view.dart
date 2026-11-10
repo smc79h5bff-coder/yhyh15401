@@ -1,0 +1,1952 @@
+// grouped_diff_view.dart
+//
+// 跨行块视图。
+//
+// 架构：
+//   - 渲染：单个 ListView，每个 item 是 Row（左右各一个 _BlockTile），
+//          高度由 IntrinsicHeight 包裹后取左右较大值，内容自然撑开。
+//          不裁切、不留块间空白、左右天然对齐。
+//   - 跳转：jumpToBottom / jumpToTop 走"遮罩 + 分帧滚动"。
+//          用户看到的是"转圈 → 到底"，看不到中间过程，不闪退、不卡死。
+//   - 块高缓存 _chunkHeights 仍保留（供 _blockOffset 采样用），但有上限。
+//   - 长按某行：弹出全屏对话框，上半编辑当前行，下半只读预览当前块 + 下一块。
+
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
+import 'package:diff_match_patch/diff_match_patch.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../core/debug/compare_timing_log.dart';
+import '../../../core/debug/crash_logger.dart';
+import '../../diff/domain/diff_operation.dart';
+import '../../diff/domain/diff_result.dart';
+import '../../import/presentation/providers/import_providers.dart';
+import 'line_height_calculator.dart';
+import 'providers/diff_viewer_providers.dart';
+import 'providers/grouped_color_providers.dart';
+import 'viewer_widgets.dart';
+
+const int _kMaxLinesPerChunk = 25;
+
+// 行内「具体哪个字改了」的高亮是在界面线程同步算的（见 _processOne），
+// 单个任务一旦开始就无法被每帧预算打断。小说里的超长段落最容易让
+// dmp.diff 一口气占满好几帧。超过这个长度就只保留整块差异底色。
+const int _kMaxHighlightBlobChars = 4000;
+// dmp 超时后会返回近似结果而不是继续硬算，把最坏长帧压到 ~0.1s。
+const double _kHighlightDiffTimeout = 0.1;
+
+// ==================== 数据模型 ====================
+
+enum GroupedBlockKind { equal, equalIgnoringWs, different }
+
+class GroupedBlock {
+  const GroupedBlock({
+    required this.leftStart,
+    required this.leftEnd,
+    required this.rightStart,
+    required this.rightEnd,
+    required this.kind,
+  });
+  final int leftStart, leftEnd, rightStart, rightEnd;
+  final GroupedBlockKind kind;
+  int get leftLength => leftEnd - leftStart;
+  int get rightLength => rightEnd - rightStart;
+  int get visualLength {
+    final l = leftLength, r = rightLength;
+    return l > r ? l : r;
+  }
+}
+
+class GroupedDiffData {
+  const GroupedDiffData({
+    required this.linesA,
+    required this.linesB,
+    required this.blocks,
+  });
+  final List<String> linesA;
+  final List<String> linesB;
+  final List<GroupedBlock> blocks;
+}
+
+// ==================== 工具 ====================
+
+bool _isWs(int c) =>
+    c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D || c == 0x0B || c == 0x0C;
+
+String _strip(String s) {
+  if (s.isEmpty) return '';
+  final buf = StringBuffer();
+  for (var i = 0; i < s.length; i++) {
+    final c = s.codeUnitAt(i);
+    if (!_isWs(c)) buf.writeCharCode(c);
+  }
+  return buf.toString();
+}
+
+// ==================== 算法 ====================
+
+GroupedDiffData buildGroupedData(DiffResult diff, String a, String b) {
+  final linesA = a.split('\n');
+  final linesB = b.split('\n');
+  final raw = <GroupedBlock>[];
+  var ai = 0, bi = 0, i = 0;
+  final entries = diff.entries;
+
+  while (i < entries.length) {
+    final e = entries[i];
+    if (e.operation == DiffOperation.equal) {
+      if (ai >= linesA.length || bi >= linesB.length) break;
+      final la = linesA[ai], ra = linesB[bi];
+      if (la == ra) {
+        raw.add(GroupedBlock(
+            leftStart: ai, leftEnd: ai + 1,
+            rightStart: bi, rightEnd: bi + 1,
+            kind: GroupedBlockKind.equal));
+      } else if (_strip(la) == _strip(ra)) {
+        raw.add(GroupedBlock(
+            leftStart: ai, leftEnd: ai + 1,
+            rightStart: bi, rightEnd: bi + 1,
+            kind: GroupedBlockKind.equalIgnoringWs));
+      } else {
+        raw.add(GroupedBlock(
+            leftStart: ai, leftEnd: ai + 1,
+            rightStart: bi, rightEnd: bi + 1,
+            kind: GroupedBlockKind.different));
+      }
+      ai++; bi++; i++;
+    } else {
+      final sA = ai, sB = bi;
+      while (i < entries.length &&
+          entries[i].operation != DiffOperation.equal) {
+        final op = entries[i].operation;
+        if (op == DiffOperation.delete || op == DiffOperation.replace) ai++;
+        if (op == DiffOperation.insert || op == DiffOperation.replace) bi++;
+        i++;
+      }
+      final eA = ai, eB = bi;
+      if (eA > sA && eB > sB) {
+        final lBlob = linesA.sublist(sA, eA).join('\n');
+        final rBlob = linesB.sublist(sB, eB).join('\n');
+        final sameWs = _strip(lBlob) == _strip(rBlob);
+        raw.add(GroupedBlock(leftStart: sA, leftEnd: eA,
+          rightStart: sB, rightEnd: eB,
+          kind: sameWs
+              ? GroupedBlockKind.equalIgnoringWs
+              : GroupedBlockKind.different));
+      } else if (eA > sA) {
+        raw.add(GroupedBlock(leftStart: sA, leftEnd: eA,
+          rightStart: sB, rightEnd: sB, kind: GroupedBlockKind.different));
+      } else if (eB > sB) {
+        raw.add(GroupedBlock(leftStart: sA, leftEnd: sA,
+          rightStart: sB, rightEnd: eB, kind: GroupedBlockKind.different));
+      }
+    }
+  }
+
+  final blocks = <GroupedBlock>[];
+  for (final b in raw) {
+    if (b.visualLength <= _kMaxLinesPerChunk) {
+      blocks.add(b);
+      continue;
+    }
+    var l = b.leftStart, r = b.rightStart;
+    while (l < b.leftEnd || r < b.rightEnd) {
+      final lRem = b.leftEnd - l, rRem = b.rightEnd - r;
+      final lTake = lRem > _kMaxLinesPerChunk ? _kMaxLinesPerChunk : lRem;
+      final rTake = rRem > _kMaxLinesPerChunk ? _kMaxLinesPerChunk : rRem;
+      blocks.add(GroupedBlock(leftStart: l, leftEnd: l + lTake,
+        rightStart: r, rightEnd: r + rTake, kind: b.kind));
+      l += lTake;
+      r += rTake;
+    }
+  }
+  return GroupedDiffData(linesA: linesA, linesB: linesB, blocks: blocks);
+}
+
+// ==================== 字符级高亮（含 LRU 缓存） ====================
+
+final Map<String, List<List<int>>> _hlCache = {};
+const int _hlCacheMax = 200;
+
+String _hlKey(String self, String other) =>
+    '${self.length}:${other.length}:${self.hashCode}:${other.hashCode}';
+
+List<List<int>> _hlCached(String selfBlob, int selfLines,
+    String otherBlob, bool onlyWs) {
+  final key = _hlKey(selfBlob, otherBlob) + ':$onlyWs';
+  final hit = _hlCache[key];
+  if (hit != null) return hit;
+  if (_hlCache.length >= _hlCacheMax) {
+    _hlCache.remove(_hlCache.keys.first);
+  }
+  final r = _blobHighlight(selfBlob, selfLines, otherBlob, onlyWs);
+  _hlCache[key] = r;
+  return r;
+}
+
+List<List<int>> _blobHighlight(
+    String selfBlob, int selfLines, String otherBlob, bool onlyWs) {
+  final r = List.generate(selfLines, (_) => <int>[]);
+  if (selfBlob.isEmpty) return r;
+  if (selfBlob.length > _kMaxHighlightBlobChars ||
+      otherBlob.length > _kMaxHighlightBlobChars) {
+    return r;
+  }
+  try {
+    final dmp = DiffMatchPatch()..diffTimeout = _kHighlightDiffTimeout;
+    final diffs = dmp.diff(selfBlob, otherBlob);
+    final starts = <int>[0];
+    for (var i = 0; i < selfBlob.length; i++) {
+      if (selfBlob.codeUnitAt(i) == 0x0A) starts.add(i + 1);
+    }
+    final lengths = <int>[];
+    for (var i = 0; i < starts.length; i++) {
+      final end = i + 1 < starts.length ? starts[i + 1] - 1 : selfBlob.length;
+      lengths.add(end - starts[i]);
+    }
+    var pos = 0;
+    for (final d in diffs) {
+      final len = d.text.length;
+      if (d.operation == DIFF_EQUAL) {
+        pos += len;
+      } else if (d.operation == DIFF_DELETE) {
+        for (var k = 0; k < len; k++) {
+          final p = pos + k;
+          if (p >= selfBlob.length) break;
+          if (onlyWs && !_isWs(selfBlob.codeUnitAt(p))) continue;
+          var lo = 0, hi = starts.length - 1;
+          while (lo < hi) {
+            final mid = (lo + hi + 1) >> 1;
+            if (starts[mid] <= p) { lo = mid; } else { hi = mid - 1; }
+          }
+          final li = lo;
+          final col = p - starts[li];
+          if (li < selfLines && col <= lengths[li]) r[li].add(col);
+        }
+        pos += len;
+      }
+    }
+  } catch (_) {}
+  return r;
+}
+
+// ==================== 视图 ====================
+
+class GroupedDiffView extends ConsumerStatefulWidget {
+  const GroupedDiffView({
+    this.deletedLeft = false,
+    this.deletedRight = false,
+    this.onDeleteFile,
+    this.onMoveFile,
+    super.key,
+  });
+
+  /// 删除确认弹窗期间，对应那一栏盖红色遮罩。
+  final bool deletedLeft;
+  final bool deletedRight;
+
+  /// 文件属性弹窗里的「删除此文件」/「移动此文件」。为 null 时不显示对应按钮。
+  final Future<void> Function({required bool isOriginal})? onDeleteFile;
+  final Future<void> Function({required bool isOriginal})? onMoveFile;
+
+  @override
+  ConsumerState<GroupedDiffView> createState() => GroupedDiffViewState();
+}
+
+class GroupedDiffViewState extends ConsumerState<GroupedDiffView> {
+  late final ScrollController _ctrl;
+
+  GroupedDiffData? _data;
+  DiffResult? _dataForDiff;
+  List<GroupedBlock>? _visible;
+
+  // ★ 跳转遮罩：为 true 时整屏被不透明色盖住，用户看不到中间的滚动过程。
+  bool _jumping = false;
+  _JumpDirection? _jumpDirection;
+
+  // ★ 块高缓存（供跳转定位用）。有上限，防止无限增长。
+  final Map<int, double> _chunkHeights = {};
+  static const int _kMaxChunkHeights = 3000;
+
+  // 未渲染块的估算高度缓存。跳转需要逐块累加高度，若每次都重新
+  // 逐字符估算会卡；数据/配置变化时会随其它缓存一起清空。
+  final Map<int, double> _estimatedHeights = {};
+
+  // 每次跳转自增。旧的那轮异步修正循环发现令牌变了就退出，
+  // 否则连点「下一个」会同时跑好几个循环、各自 jumpTo，落点被互相覆盖。
+  int _jumpGeneration = 0;
+
+  // 只给「本次跳转的目标块」挂一个 GlobalKey：估算高度先把目标块带到
+  // 附近，最终用 Scrollable.ensureVisible 按真实渲染位置精调。
+  // 不给几千个块各建 GlobalKey —— 大文件时 Element 注册开销会很明显。
+  GlobalKey? _targetKey;
+  int? _targetKeyIdx;
+  void _ensureTargetKey(int idx) {
+    if (_targetKeyIdx == idx && _targetKey != null) return;
+    _targetKeyIdx = idx;
+    _targetKey = GlobalKey();
+  }
+
+  // 字符级高亮缓存。有上限。
+  final Map<String, List<List<int>>> _highlightsCache = {};
+  static const int _kMaxHighlights = 500;
+  final Set<String> _pendingHighlights = {};
+  final Set<int> _pendingHeights = {};
+  bool _processing = false;
+  final Set<int> _recentlyVisible = {};
+
+  // 短文件结束提示（块索引）
+  int? _shortFileLastBlockIdx;
+  DiffResult? _shortFileLastBlockIdxFor;
+  int? _shortFileLastBlockIdxCtxLines;
+  bool _shortIsLeft = true;
+
+  // 缓存失效用
+  bool? _cacheShowLine;
+  double? _cacheBodyFont;
+  double? _cacheCtxFont;
+  double? _cacheGutterFont;
+  TextScaler? _cacheScaler;
+  double? _cacheContentWidth;
+  int? _lastCtxLines;
+
+  String _findQuery = '';
+  int? _jumpedBlockIdx;
+
+  DiffResult? _metaFor;
+  List<({int orig, int mod})>? _metaCache;
+
+  double? _pendingRestoreOffset;
+  int _restoreAttempts = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = ScrollController();
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    _pendingHighlights.clear();
+    _pendingHeights.clear();
+    _highlightsCache.clear();
+    _hlCache.clear();
+    super.dispose();
+  }
+
+  // ==================== 给外部（主 screen）的公开方法 ====================
+
+  void updateFindQuery(String q) {
+    if (_findQuery == q) return;
+    setState(() => _findQuery = q);
+  }
+
+  void clearFind() {
+    if (_findQuery.isEmpty && _jumpedBlockIdx == null) return;
+    setState(() {
+      _findQuery = '';
+      _jumpedBlockIdx = null;
+    });
+  }
+
+  double? get currentScrollOffset {
+    if (!_ctrl.hasClients) return null;
+    return _ctrl.offset;
+  }
+
+  void restoreScrollOffset(double offset) {
+    _pendingRestoreOffset = offset;
+    _restoreAttempts = 0;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _tryRestoreOffset();
+    });
+  }
+
+  void _tryRestoreOffset() {
+    if (_pendingRestoreOffset == null) {
+      final fromProvider = ref.read(groupedRestoreOffsetProvider);
+      if (fromProvider != null) {
+        _pendingRestoreOffset = fromProvider;
+        ref.read(groupedRestoreOffsetProvider.notifier).state = null;
+        _restoreAttempts = 0;
+      }
+    }
+
+    final o = _pendingRestoreOffset;
+    if (o == null) return;
+
+    if (_restoreAttempts >= 120) {
+      _pendingRestoreOffset = null;
+      _restoreAttempts = 0;
+      return;
+    }
+
+    final latest = ref.read(diffResultProvider).value;
+    if (latest == null || !identical(_dataForDiff, latest)) {
+      _restoreAttempts++;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _tryRestoreOffset();
+      });
+      return;
+    }
+
+    if (!_ctrl.hasClients) {
+      _restoreAttempts++;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _tryRestoreOffset();
+      });
+      return;
+    }
+
+    final max = _ctrl.position.maxScrollExtent;
+    if (max < o) {
+      _restoreAttempts++;
+      if (_restoreAttempts >= 120) {
+        _ctrl.jumpTo(max);
+        _pendingRestoreOffset = null;
+        _restoreAttempts = 0;
+        return;
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _tryRestoreOffset();
+      });
+      return;
+    }
+
+    _ctrl.jumpTo(o.clamp(0.0, max));
+    _pendingRestoreOffset = null;
+    _restoreAttempts = 0;
+  }
+
+  bool scrollToEntry(int entryIdx) {
+    final blockIdx = _blockIdxForEntry(entryIdx);
+    if (blockIdx == null) return false;
+    setState(() => _jumpedBlockIdx = blockIdx);
+    _jumpToBlockAnimated(blockIdx);
+    return true;
+  }
+
+  // ==================== 差异跳转 ====================
+
+  void pageUp() {
+    if (!_ctrl.hasClients) return;
+    final p = _ctrl.position;
+    final t = (p.pixels - p.viewportDimension * 0.95)
+        .clamp(0.0, p.maxScrollExtent);
+    if ((t - p.pixels).abs() < 0.5) return;
+    _ctrl.jumpTo(t);
+  }
+
+  void pageDown() {
+    if (!_ctrl.hasClients) return;
+    final p = _ctrl.position;
+    final t = (p.pixels + p.viewportDimension * 0.95)
+        .clamp(0.0, p.maxScrollExtent);
+    if ((t - p.pixels).abs() < 0.5) return;
+    _ctrl.jumpTo(t);
+  }
+
+  // ★ 遮罩 + 分帧滚动，跳到底。用户看到"转圈 → 到底"，中间过程不可见。
+  Future<void> jumpToBottom() async {
+    CrashLogger.instance.mark('grouped: 跳到最后一个差异块');
+    if (!_ctrl.hasClients) return;
+    if (_jumping) return;
+
+    ++_jumpGeneration; // 停掉可能还在跑的查找跳转循环
+    setState(() {
+      _jumping = true;
+      _jumpDirection = _JumpDirection.down;
+    });
+    // 等遮罩画上去
+    await WidgetsBinding.instance.endOfFrame;
+
+    var stableFrames = 0;
+    for (var step = 0; step < 3000; step++) {
+      if (!mounted || !_ctrl.hasClients) break;
+      final p = _ctrl.position;
+
+      if (p.pixels >= p.maxScrollExtent - 0.5) {
+        stableFrames++;
+        if (stableFrames >= 3) break;
+      } else {
+        stableFrames = 0;
+        final next = (p.pixels + p.viewportDimension * 30)
+            .clamp(0.0, p.maxScrollExtent);
+        if ((next - p.pixels).abs() < 0.5) {
+          _ctrl.jumpTo(p.maxScrollExtent);
+        } else {
+          _ctrl.jumpTo(next);
+        }
+      }
+      await WidgetsBinding.instance.endOfFrame;
+    }
+
+    if (mounted && _ctrl.hasClients) {
+      final p = _ctrl.position;
+      if (p.pixels < p.maxScrollExtent - 0.5) {
+        _ctrl.jumpTo(p.maxScrollExtent);
+        await WidgetsBinding.instance.endOfFrame;
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _jumping = false;
+      // 跳到结尾和别的视图一样，不额外高亮。
+      // 想找最后一处差异请用「下一处差异」按钮。
+      _jumpedBlockIdx = null;
+    });
+  }
+
+  // ★ 跳顶部同样用遮罩（索引小一般很快，但保持行为一致）。
+  Future<void> jumpToTop() async {
+    CrashLogger.instance.mark('grouped: 跳到第一个差异块');
+    if (!_ctrl.hasClients) return;
+    if (_jumping) return;
+
+    int? target;
+    final visible = _visible;
+    if (visible != null) {
+      for (var i = 0; i < visible.length; i++) {
+        if (visible[i].kind != GroupedBlockKind.equal) {
+          target = i;
+          break;
+        }
+      }
+    }
+
+    if (target == null) {
+      _ctrl.jumpTo(0);
+      if (_jumpedBlockIdx != null) {
+        setState(() => _jumpedBlockIdx = null);
+      }
+      return;
+    }
+
+    // 如果当前位置本来就很靠前，直接跳，不用遮罩。
+    if (_ctrl.offset < 3000) {
+      _ctrl.jumpTo(0);
+      setState(() => _jumpedBlockIdx = target);
+      return;
+    }
+
+    ++_jumpGeneration; // 停掉可能还在跑的查找跳转循环
+    setState(() {
+      _jumping = true;
+      _jumpDirection = _JumpDirection.up;
+    });
+    await WidgetsBinding.instance.endOfFrame;
+
+    for (var step = 0; step < 300; step++) {
+      if (!mounted || !_ctrl.hasClients) break;
+      final p = _ctrl.position;
+      if (p.pixels <= 0.5) break;
+      final next = (p.pixels - p.viewportDimension * 30)
+          .clamp(0.0, p.maxScrollExtent);
+      if ((p.pixels - next).abs() < 0.5) break;
+      _ctrl.jumpTo(next);
+      await WidgetsBinding.instance.endOfFrame;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _jumping = false;
+      _jumpedBlockIdx = target;
+    });
+  }
+
+  Future<void> _jumpToBlockAnimated(int targetIdx) async {
+    if (!mounted) return;
+    if (!_ctrl.hasClients) return;
+    if (_jumping) return;
+    final visible = _visible;
+    if (visible == null ||
+        targetIdx < 0 ||
+        targetIdx >= visible.length) return;
+
+    // 换目标就换 key，让下一次 itemBuilder 把 key 挂到新的目标块上。
+    if (_targetKeyIdx != targetIdx || _targetKey == null) {
+      setState(() => _ensureTargetKey(targetIdx));
+    }
+
+    // 本次跳转的令牌。连点「上一个 / 下一个」时旧循环立刻退出，
+    // 否则好几个 async 循环同时 jumpTo，最后停在哪一处全看运气。
+    final gen = ++_jumpGeneration;
+    bool stale() =>
+        !mounted || !_ctrl.hasClients || gen != _jumpGeneration;
+
+    var correction = 0.0;
+    var nudges = 0;
+    for (var attempt = 0; attempt < 24; attempt++) {
+      if (stale()) return;
+
+      final max = _ctrl.position.maxScrollExtent;
+      // 内容不足一屏时所有块本来就都可见，不必空转 24 帧。
+      if (max <= 0) return;
+      final desired =
+          (_blockOffset(targetIdx) + correction).clamp(0.0, max).toDouble();
+      _ctrl.jumpTo(desired);
+
+      await WidgetsBinding.instance.endOfFrame;
+      if (stale()) return;
+
+      // 目标块一旦被 ListView 布局出来，就按它「真实渲染的位置」精调。
+      // 前面几百块的高度只是估算值，累计误差会造成「估算上已到位、
+      // 屏幕上却是别的块」；ensureVisible 走的是实际像素，能闭环。
+      final ctx = _targetKey?.currentContext;
+      if (ctx != null) {
+        try {
+          await Scrollable.ensureVisible(
+            ctx,
+            alignment: 0.08,
+            duration: Duration.zero,
+          );
+        } catch (_) {
+          // 块在这一帧被回收了：保留本轮 jumpTo 的结果即可。
+        }
+        return;
+      }
+
+      // 目标块还没布局出来（估算落点偏远）：继续按估算反馈靠拢。
+      final cur = _currentBlockIdx();
+      if (cur == null) return;
+      final delta = cur - targetIdx;
+      if (delta == 0) {
+        // 估算认为到位、目标块却没被布局出来：上下交替微调半屏把它
+        // 找出来（同 diff_scroll_helper.dart:81-92 的做法），最多 4 次。
+        if (nudges >= 4) return;
+        nudges++;
+        final viewport = _ctrl.position.viewportDimension;
+        correction += viewport * 0.5 * (nudges.isOdd ? 1.0 : -1.0);
+        continue;
+      }
+      correction -= delta * _heightOf(cur) * 0.8;
+
+      // 还没滚到目标但已顶到当前可滚动极限：先滚到极限，
+      // 逼 ListView 继续布局后面的块，下一轮 maxScrollExtent 才会变大。
+      if (delta < 0 && desired >= max - 0.5) {
+        _ctrl.jumpTo(_ctrl.position.maxScrollExtent);
+        await WidgetsBinding.instance.endOfFrame;
+      }
+    }
+  }
+
+  static const int _kLongSegThreshold = 3;
+
+  ({int start, int end})? _segmentAt(int idx, List<GroupedBlock> visible) {
+    if (idx < 0 || idx >= visible.length) return null;
+    if (visible[idx].kind == GroupedBlockKind.equal) return null;
+    var start = idx;
+    while (start > 0 &&
+        visible[start - 1].kind != GroupedBlockKind.equal) {
+      start--;
+    }
+    var end = idx;
+    while (end + 1 < visible.length &&
+        visible[end + 1].kind != GroupedBlockKind.equal) {
+      end++;
+    }
+    return (start: start, end: end);
+  }
+
+  void jumpToNextDiff() {
+    final visible = _visible;
+    if (visible == null || !_ctrl.hasClients) return;
+    final cur = _currentBlockIdx() ?? -1;
+
+    int? target;
+
+    final noEqual = !visible.any((b) => b.kind == GroupedBlockKind.equal);
+    if (noEqual) {
+      target = cur < visible.length - 1 ? cur + 1 : null;
+    } else {
+      final seg = _segmentAt(cur, visible);
+      if (seg == null) {
+        var i = cur + 1;
+        while (i < visible.length &&
+            visible[i].kind == GroupedBlockKind.equal) {
+          i++;
+        }
+        if (i < visible.length) target = i;
+      } else {
+        final len = seg.end - seg.start + 1;
+        if (cur < seg.end) {
+          target = len > _kLongSegThreshold ? seg.end : cur + 1;
+        } else {
+          var i = seg.end + 1;
+          while (i < visible.length &&
+              visible[i].kind == GroupedBlockKind.equal) {
+            i++;
+          }
+          if (i < visible.length) target = i;
+        }
+      }
+    }
+
+    if (target == null) {
+      _toast('到底了');
+      return;
+    }
+    setState(() => _jumpedBlockIdx = target);
+    _jumpToBlockAnimated(target);
+  }
+
+  void jumpToPrevDiff() {
+    final visible = _visible;
+    if (visible == null || !_ctrl.hasClients) return;
+    final cur = _currentBlockIdx() ?? visible.length;
+
+    int? target;
+
+    final noEqual = !visible.any((b) => b.kind == GroupedBlockKind.equal);
+    if (noEqual) {
+      target = cur > 0 ? cur - 1 : null;
+    } else {
+      final seg = _segmentAt(cur, visible);
+      if (seg == null) {
+        var i = cur - 1;
+        while (i >= 0 && visible[i].kind == GroupedBlockKind.equal) {
+          i--;
+        }
+        if (i >= 0) {
+          while (i > 0 && visible[i - 1].kind != GroupedBlockKind.equal) {
+            i--;
+          }
+          target = i;
+        }
+      } else {
+        final len = seg.end - seg.start + 1;
+        if (cur > seg.start) {
+          target = len > _kLongSegThreshold ? seg.start : cur - 1;
+        } else {
+          var i = seg.start - 1;
+          while (i >= 0 && visible[i].kind == GroupedBlockKind.equal) {
+            i--;
+          }
+          if (i >= 0) {
+            while (i > 0 && visible[i - 1].kind != GroupedBlockKind.equal) {
+              i--;
+            }
+            target = i;
+          }
+        }
+      }
+    }
+
+    if (target == null) {
+      _toast('到顶了');
+      return;
+    }
+    setState(() => _jumpedBlockIdx = target);
+    _jumpToBlockAnimated(target);
+  }
+
+  // ==================== 内部 ====================
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  double _heightOf(int idx) {
+    final visible = _visible;
+    if (visible == null || idx < 0 || idx >= visible.length) return 24.0;
+    final cached = _chunkHeights[idx];
+    if (cached != null) return cached;
+    final estimated = _estimatedHeights[idx];
+    if (estimated != null) return estimated;
+    final h = _estimateBlockHeight(visible[idx]);
+    // 块数最多几千、每项一个 double，内存可忽略；数据/字号变化时
+    // 会随其它缓存一起清空，不必在这里再设上限导致反复重新估算。
+    _estimatedHeights[idx] = h;
+    return h;
+  }
+
+  /// 逐块累加高度。_heightOf 对未渲染块有估算缓存，所以这里只是
+  /// O(idx) 次查表，不会卡。
+  ///
+  /// 旧实现在 idx > 200 时用「前 100 块的平均高度 × idx」外推：
+  /// 开头多是短的上下文块，块高差异一大，第几百块的落点就会偏出
+  /// 好几个块，表现为「查找跳转到的不是搜到的那一处」。
+  double _blockOffset(int idx) {
+    final visible = _visible;
+    if (visible == null || idx <= 0) return 0;
+    final end = idx < visible.length ? idx : visible.length;
+    double acc = 0;
+    for (var i = 0; i < end; i++) {
+      acc += _heightOf(i);
+    }
+    return acc;
+  }
+
+  int? _currentBlockIdx() {
+    if (!_ctrl.hasClients || _visible == null) return null;
+    final off = _ctrl.offset;
+    final visible = _visible!;
+
+    // 与 _blockOffset 用同一套逐块高度。旧实现在块数 > 400 时先用
+    // 「平均高度」猜起点再从那里累加，跳过去按一套算法算、反查当前块
+    // 按另一套算，反馈修正会朝错误方向调整，越跳越偏。
+    double acc = 0;
+    for (var i = 0; i < visible.length; i++) {
+      final h = _heightOf(i);
+      if (off < acc + h) return i;
+      acc += h;
+    }
+    return visible.length - 1;
+  }
+
+  int? _blockIdxForEntry(int entryIdx) {
+    final diff = _dataForDiff;
+    final visible = _visible;
+    if (diff == null || visible == null) return null;
+    if (entryIdx < 0 || entryIdx >= diff.entries.length) return null;
+    final meta = _computeLineMeta(diff);
+    final m = meta[entryIdx];
+    if (m.orig >= 0) {
+      for (var i = 0; i < visible.length; i++) {
+        final b = visible[i];
+        if (m.orig >= b.leftStart && m.orig < b.leftEnd) return i;
+      }
+    }
+    if (m.mod >= 0) {
+      for (var i = 0; i < visible.length; i++) {
+        final b = visible[i];
+        if (m.mod >= b.rightStart && m.mod < b.rightEnd) return i;
+      }
+    }
+    return null;
+  }
+
+  List<({int orig, int mod})> _computeLineMeta(DiffResult result) {
+    if (identical(_metaFor, result) && _metaCache != null) return _metaCache!;
+    final meta = <({int orig, int mod})>[];
+    var o = 0, m = 0;
+    for (final e in result.entries) {
+      final usesOrig = e.operation == DiffOperation.equal ||
+          e.operation == DiffOperation.delete ||
+          e.operation == DiffOperation.replace;
+      final usesMod = e.operation == DiffOperation.equal ||
+          e.operation == DiffOperation.insert ||
+          e.operation == DiffOperation.replace;
+      meta.add((orig: usesOrig ? o : -1, mod: usesMod ? m : -1));
+      if (usesOrig) o++;
+      if (usesMod) m++;
+    }
+    _metaFor = result;
+    _metaCache = meta;
+    return meta;
+  }
+
+  int? _computeShortFileEndBlockIdx(GroupedDiffData data) {
+    if (data.linesA.isEmpty || data.linesB.isEmpty) return null;
+    final lenA = data.linesA.length;
+    final lenB = data.linesB.length;
+    if (lenA == lenB) return null;
+    const int minDiff = 100;
+    if ((lenA - lenB).abs() < minDiff) return null;
+
+    final shortIsLeft = lenA < lenB;
+    _shortIsLeft = shortIsLeft;
+    final shortLineCount = shortIsLeft ? lenA : lenB;
+    final visible = _visible;
+    if (visible == null || visible.isEmpty) return null;
+
+    for (var i = visible.length - 1; i >= 0; i--) {
+      final b = visible[i];
+      final blockStart = shortIsLeft ? b.leftStart : b.rightStart;
+      if (blockStart < shortLineCount) {
+        return i;
+      }
+    }
+    return visible.length - 1;
+  }
+
+  Future<void> _onLineLongPress(int lineIdx, bool isLeft) async {
+  final provider = isLeft
+      ? preprocessedOriginalProvider
+      : preprocessedModifiedProvider;
+  final current = ref.read(provider);
+  if (current.isEmpty) return;
+  final lines = current.split('\n');
+  if (lineIdx < 0 || lineIdx >= lines.length) return;
+
+  final ctrl = TextEditingController(text: lines[lineIdx]);
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (c) => AlertDialog(
+      insetPadding: const EdgeInsets.all(8),
+      title: Text('编辑第 ${lineIdx + 1} 行（${isLeft ? "左" : "右"}）',
+          style: const TextStyle(fontSize: 14)),
+      content: TextField(
+        controller: ctrl,
+        maxLines: null,
+        autofocus: true,
+        style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
+        decoration: const InputDecoration(border: OutlineInputBorder()),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(c, false),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(c, true),
+          child: const Text('确定'),
+        ),
+      ],
+    ),
+  );
+  if (ok != true || !mounted) return;
+
+  lines[lineIdx] = ctrl.text;
+  final newText = lines.join('\n');
+  if (isLeft) {
+    ref.read(editedOriginalProvider.notifier).state = newText;
+  } else {
+    ref.read(editedModifiedProvider.notifier).state = newText;
+  }
+  ref.read(importRevisionProvider.notifier).state++;
+  _dataForDiff = null;
+  _metaFor = null;
+  _metaCache = null;
+  if (mounted) setState(() {});
+}
+
+  // ==================== 构建 ====================
+
+  @override
+  Widget build(BuildContext context) {
+    final diffAsync = ref.watch(diffResultProvider);
+    final a = ref.watch(preprocessedOriginalProvider);
+    final b = ref.watch(preprocessedModifiedProvider);
+
+    return diffAsync.when(
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (e, _) => Center(child: Text('错误：$e')),
+      data: (diff) {
+        if (diff == null) {
+          return const Center(child: Text('请先导入两份文档'));
+        }
+
+        if (!identical(_dataForDiff, diff)) {
+          CrashLogger.instance
+              .mark('[restore] 新数据到达 pending=$_pendingRestoreOffset');
+          _dataForDiff = diff;
+          final log = CompareTimingLog.instance;
+          _data = log.measure(
+            '完整对比页 buildGroupedData 建块',
+            () => buildGroupedData(diff, a, b),
+          );
+          if (log.active) {
+            log.param('完整对比/建块数', _data?.blocks.length ?? 0);
+            log.param('完整对比/左全文行数', _data?.linesA.length ?? 0);
+            log.param('完整对比/右全文行数', _data?.linesB.length ?? 0);
+            log.mark('完整对比建块完成');
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              log.mark('完整对比首帧绘制完成');
+              log.end('完整对比 · 从点击到内容可见');
+            });
+          }
+          _visible = null;
+          _chunkHeights.clear();
+          _estimatedHeights.clear();
+          _targetKey = null;
+          _targetKeyIdx = null;
+          _highlightsCache.clear();
+          _pendingHeights.clear();
+          _pendingHighlights.clear();
+          _recentlyVisible.clear();
+          _shortFileLastBlockIdx = null;
+          _shortFileLastBlockIdxFor = null;
+          _shortFileLastBlockIdxCtxLines = null;
+          _metaFor = null;
+          _metaCache = null;
+
+          _restoreAttempts = 0;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _tryRestoreOffset();
+          });
+        }
+        return _buildBody(_data!);
+      },
+    );
+  }
+
+  Widget _buildBody(GroupedDiffData data) {
+    final showLine = ref.watch(showLineNumbersProvider);
+    final bodyFs = ref.watch(bodyFontSizeProvider);
+    final gutterFs = ref.watch(gutterFontSizeProvider);
+    final ctxFs = ref.watch(contextFontSizeProvider);
+    final textScaler = MediaQuery.of(context).textScaler;
+
+    final colors = _Colors(
+      diffLeftBg: ref.watch(replaceLeftBgProvider),
+      diffRightBg: ref.watch(replaceRightBgProvider),
+      charDeleteBg: ref.watch(charDeleteBgProvider),
+      charDeleteFg: ref.watch(charDeleteFgProvider),
+      charInsertBg: ref.watch(charInsertBgProvider),
+      charInsertFg: ref.watch(charInsertFgProvider),
+      equalIgnoringWsBg: ref.watch(groupedEqualIgnoringWsBgProvider),
+      wsHighlight: ref.watch(groupedWsHighlightProvider),
+      findYellow: ref.watch(groupedFindYellowProvider),
+      findPink: ref.watch(groupedFindPinkProvider),
+    );
+
+    final mq = MediaQuery.of(context);
+    final viewportW = mq.size.width;
+    final halfW = (viewportW - 1) / 2;
+    final contentW = halfW - (showLine ? 36.0 : 2.0);
+
+    if (_cacheShowLine != showLine ||
+        _cacheBodyFont != bodyFs ||
+        _cacheCtxFont != ctxFs ||
+        _cacheGutterFont != gutterFs ||
+        _cacheScaler != textScaler ||
+        _cacheContentWidth != contentW) {
+      _chunkHeights.clear();
+      _estimatedHeights.clear();
+      _highlightsCache.clear();
+      _pendingHeights.clear();
+      _pendingHighlights.clear();
+      _recentlyVisible.clear();
+      _cacheShowLine = showLine;
+      _cacheBodyFont = bodyFs;
+      _cacheCtxFont = ctxFs;
+      _cacheGutterFont = gutterFs;
+      _cacheScaler = textScaler;
+      _cacheContentWidth = contentW;
+    }
+
+    final ctxLines = ref.watch(groupedContextLinesProvider).round();
+    if (_lastCtxLines != ctxLines) {
+      _lastCtxLines = ctxLines;
+      _visible = null;
+      _chunkHeights.clear();
+      _estimatedHeights.clear();
+      _targetKey = null;
+      _targetKeyIdx = null;
+      _highlightsCache.clear();
+      _pendingHeights.clear();
+      _pendingHighlights.clear();
+      _recentlyVisible.clear();
+    }
+    _visible ??= _filter(data.blocks, ctxLines);
+    final visible = _visible!;
+    if (visible.isEmpty) {
+      return const Center(child: Text('两份文档完全相同'));
+    }
+
+    if (!identical(_shortFileLastBlockIdxFor, _dataForDiff) ||
+        _shortFileLastBlockIdxCtxLines != ctxLines) {
+      _shortFileLastBlockIdx = _computeShortFileEndBlockIdx(data);
+      _shortFileLastBlockIdxFor = _dataForDiff;
+      _shortFileLastBlockIdxCtxLines = ctxLines;
+    }
+
+    final shortLineCount =
+        _shortIsLeft ? data.linesA.length : data.linesB.length;
+
+    final origName = ref.watch(originalFileNameProvider);
+    final modName = ref.watch(modifiedFileNameProvider);
+
+    final s = Theme.of(context).colorScheme;
+    final divider = Container(width: 1, color: s.outlineVariant);
+
+    final listView = ListView.builder(
+      controller: _ctrl,
+      addAutomaticKeepAlives: false,
+      addRepaintBoundaries: false,
+      // 估算高度难免偏几个块。多预构建一点，让目标块有机会被布局出来，
+      // 跳转才能用 Scrollable.ensureVisible 按真实像素精调，而不是
+      // 一直依赖估算值。只多约半屏，不明显增加首帧负担。
+      cacheExtent: 400,
+      itemCount: visible.length,
+      itemBuilder: (ctx, i) {
+        final b = visible[i];
+
+        // 触发块高计算（供跳转定位用，不影响本 item 的渲染高度）。
+        // _jumping 期间不排队，避免内存暴涨。
+        _heightForBlock(i);
+
+        final showMarkLeft =
+            _shortIsLeft && _shortFileLastBlockIdx == i;
+        final showMarkRight =
+            !_shortIsLeft && _shortFileLastBlockIdx == i;
+
+        final afterShortEndLeft = _shortIsLeft &&
+            _shortFileLastBlockIdx != null &&
+            b.leftStart >= shortLineCount;
+        final afterShortEndRight = !_shortIsLeft &&
+            _shortFileLastBlockIdx != null &&
+            b.rightStart >= shortLineCount;
+
+        final isCurrent = _jumpedBlockIdx == i;
+
+        // 当前命中块的黑框由 _BlockTile 自己画（见本文件 :1672），
+        // 与 findQuery 无关：高级搜索下黄/粉被清空时黑框依然在，
+        // 这里不需要再套一层边框。KeyedSubtree 只供跳转精确定位用。
+        return KeyedSubtree(
+          key: i == _targetKeyIdx ? _targetKey : null,
+          child: IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  child: _BlockTile(
+                    block: b, data: data, side: _Side.left,
+                    showLineNumbers: showLine,
+                    bodyFontSize: bodyFs,
+                    contextFontSize: ctxFs,
+                    gutterFontSize: gutterFs,
+                    findQuery: _findQuery,
+                    isCurrent: isCurrent,
+                    highlights: _getHighlightOrNull(i, _Side.left),
+                    showShortEndMark: showMarkLeft,
+                    afterShortEnd: afterShortEndLeft,
+                    colors: colors,
+                    onLineLongPress: _onLineLongPress,
+                  ),
+                ),
+                divider,
+                Expanded(
+                  child: _BlockTile(
+                    block: b, data: data, side: _Side.right,
+                    showLineNumbers: showLine,
+                    bodyFontSize: bodyFs,
+                    contextFontSize: ctxFs,
+                    gutterFontSize: gutterFs,
+                    findQuery: _findQuery,
+                    isCurrent: isCurrent,
+                    highlights: _getHighlightOrNull(i, _Side.right),
+                    showShortEndMark: showMarkRight,
+                    afterShortEnd: afterShortEndRight,
+                    colors: colors,
+                    onLineLongPress: _onLineLongPress,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Column(
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: (origName == null || origName.isEmpty)
+                  ? const SizedBox.shrink()
+                  : ViewerPaneHeader(
+                      fileName: origName,
+                      isLeft: true,
+                      fontSize: 12,
+                      iconSize: 16,
+                      onDelete: widget.onDeleteFile == null
+                          ? null
+                          : () => widget.onDeleteFile!(isOriginal: true),
+                      onMove: widget.onMoveFile == null
+                          ? null
+                          : () => widget.onMoveFile!(isOriginal: true),
+                    ),
+            ),
+            divider,
+            Expanded(
+              child: (modName == null || modName.isEmpty)
+                  ? const SizedBox.shrink()
+                  : ViewerPaneHeader(
+                      fileName: modName,
+                      isLeft: false,
+                      fontSize: 12,
+                      iconSize: 16,
+                      onDelete: widget.onDeleteFile == null
+                          ? null
+                          : () => widget.onDeleteFile!(isOriginal: false),
+                      onMove: widget.onMoveFile == null
+                          ? null
+                          : () => widget.onMoveFile!(isOriginal: false),
+                    ),
+            ),
+          ],
+        ),
+        Expanded(
+          child: Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: isDark
+                    ? const [Color(0xFF0F1620), Color(0xFF0A0F16)]
+                    : const [Color(0xFFF0F5FA), Color(0xFFE8EFF7)],
+              ),
+            ),
+            child: Stack(
+              children: [
+                buildViewerScrollbar(child: listView, controller: _ctrl),
+                // 删除确认时，给即将被删的那一栏盖红色遮罩。
+                if (widget.deletedLeft)
+                  Positioned.fill(
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: FractionallySizedBox(
+                        widthFactor: 0.5,
+                        heightFactor: 1,
+                        child: buildDeletedPaneOverlay(
+                          context: context,
+                          child: const SizedBox.expand(),
+                          deleted: true,
+                        ),
+                      ),
+                    ),
+                  ),
+                if (widget.deletedRight)
+                  Positioned.fill(
+                    child: Align(
+                      alignment: Alignment.centerRight,
+                      child: FractionallySizedBox(
+                        widthFactor: 0.5,
+                        heightFactor: 1,
+                        child: buildDeletedPaneOverlay(
+                          context: context,
+                          child: const SizedBox.expand(),
+                          deleted: true,
+                        ),
+                      ),
+                    ),
+                  ),
+                if (_jumping)
+                  Positioned.fill(
+                    child: ColoredBox(
+                      color: Theme.of(context).colorScheme.surface,
+                      child: Center(
+                        child: _JumpIndicator(
+                          direction: _jumpDirection ?? _JumpDirection.down,
+                          size: 64,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ==================== 块高计算 ====================
+
+  void _heightForBlock(int blockIndex) {
+    if (_jumping) return;   // ★ 遮罩期间不排任务
+    if (_recentlyVisible.length > 300) _recentlyVisible.clear();
+    _recentlyVisible.add(blockIndex);
+
+    if (_chunkHeights.containsKey(blockIndex)) return;
+    if (_pendingHeights.contains(blockIndex)) return;
+    if (_pendingHeights.length >= 100) return;   // ★ 队列上限
+    _pendingHeights.add(blockIndex);
+    _scheduleProcess();
+  }
+
+  double _estimateBlockHeight(GroupedBlock b) {
+    final data = _data;
+    if (data == null) return 24.0;
+    final isContext = b.kind == GroupedBlockKind.equal;
+    final fs = isContext
+        ? ref.read(contextFontSizeProvider)
+        : ref.read(bodyFontSizeProvider);
+    final strutH = fs * 1.4;
+    final contentW = _cacheContentWidth ?? 100.0;
+
+    double estimateLines(List<String> lines, int start, int end) {
+      var acc = 0.0;
+      for (var i = start; i < end; i++) {
+        if (i < 0 || i >= lines.length) continue;
+        final t = lines[i];
+        if (t.isEmpty) {
+          acc += 1;
+          continue;
+        }
+        // 与遍历 runes 逐字等价（含代理对合并成一个全宽字），但不为每行
+        // 创建 rune 迭代器。跳到结尾时 _blockOffset 会一口气估算全篇所有
+        // 块，这段是热点：大文件下能省掉几十万次迭代器分配。
+        double w = 0;
+        for (var k = 0; k < t.length; k++) {
+          final c = t.codeUnitAt(k);
+          if (c >= 0xD800 && c <= 0xDBFF && k + 1 < t.length) {
+            final lo = t.codeUnitAt(k + 1);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+              w += fs;
+              k++;
+              continue;
+            }
+          }
+          w += c < 128 ? fs * 0.6 : fs;
+        }
+        final rows = (w / contentW).ceil();
+        acc += rows < 1 ? 1 : rows;
+      }
+      return acc;
+    }
+
+    final leftN = estimateLines(data.linesA, b.leftStart, b.leftEnd);
+    final rightN = estimateLines(data.linesB, b.rightStart, b.rightEnd);
+    final n = leftN > rightN ? leftN : rightN;
+    return n * strutH + 8;
+  }
+
+  double _computeHeight(int blockIndex) {
+    final visible = _visible;
+    final data = _data;
+    if (visible == null || data == null ||
+        blockIndex < 0 || blockIndex >= visible.length) return 24.0;
+
+    final b = visible[blockIndex];
+    final isContext = b.kind == GroupedBlockKind.equal;
+    final fs = isContext
+        ? ref.read(contextFontSizeProvider)
+        : ref.read(bodyFontSizeProvider);
+    final width = _cacheContentWidth ?? 100.0;
+    final scaler = _cacheScaler ?? TextScaler.noScaling;
+    final style = TextStyle(fontSize: fs, height: 1.4);
+    final strut = StrutStyle(
+      fontSize: fs,
+      height: 1.4,
+      forceStrutHeight: true,
+    );
+
+    final showLine = ref.read(showLineNumbersProvider);
+    final gutterFs = ref.read(gutterFontSizeProvider);
+    final gutterStyle = TextStyle(fontSize: gutterFs, height: 1.4);
+    final gutterStrut = StrutStyle(
+      fontSize: gutterFs,
+      height: 1.4,
+      forceStrutHeight: true,
+    );
+    final gutterH = showLine
+        ? measureTextHeight(
+            text: '0',
+            maxWidth: 30,
+            style: gutterStyle,
+            textScaler: scaler,
+            strutStyle: gutterStrut,
+          )
+        : 0.0;
+
+    double measureLine(String text) {
+      final t = text.isEmpty ? ' ' : text;
+      final h = measureTextHeight(
+        text: t,
+        maxWidth: width,
+        style: style,
+        textScaler: scaler,
+        strutStyle: strut,
+      );
+      return h > gutterH ? h : gutterH;
+    }
+
+    double lh = 0;
+    for (var i = b.leftStart; i < b.leftEnd; i++) {
+      if (i < 0 || i >= data.linesA.length) continue;
+      lh += measureLine(data.linesA[i]);
+    }
+    double rh = 0;
+    for (var i = b.rightStart; i < b.rightEnd; i++) {
+      if (i < 0 || i >= data.linesB.length) continue;
+      rh += measureLine(data.linesB[i]);
+    }
+
+    final blank = measureTextHeight(
+      text: ' ', maxWidth: width, style: style, textScaler: scaler,
+      strutStyle: strut);
+    if (lh == 0) lh = blank;
+    if (rh == 0) rh = blank;
+    return (lh > rh ? lh : rh) + 8;
+  }
+
+  // ==================== 高亮异步 ====================
+
+  List<List<int>>? _getHighlightOrNull(int blockIndex, _Side side) {
+    if (_jumping) return null;   // ★ 遮罩期间不排任务
+    if (_recentlyVisible.length > 300) _recentlyVisible.clear();
+    _recentlyVisible.add(blockIndex);
+
+    final key = _hlKeyFor(blockIndex, side);
+    final cached = _highlightsCache[key];
+    if (cached != null) return cached;
+    if (_pendingHighlights.contains(key)) return null;
+    if (_pendingHighlights.length >= 200) return null;   // ★ 队列上限
+    _pendingHighlights.add(key);
+    _scheduleProcess();
+    return null;
+  }
+
+  String _hlKeyFor(int blockIndex, _Side side) =>
+      '$blockIndex:${side == _Side.left ? "L" : "R"}';
+
+  List<List<int>> _computeHighlight(int blockIndex, _Side side) {
+    final visible = _visible;
+    final data = _data;
+    if (visible == null || data == null ||
+        blockIndex < 0 || blockIndex >= visible.length) {
+      return const [];
+    }
+    final b = visible[blockIndex];
+    final isLeft = side == _Side.left;
+    final start = isLeft ? b.leftStart : b.rightStart;
+    final end = isLeft ? b.leftEnd : b.rightEnd;
+    final lines = isLeft ? data.linesA : data.linesB;
+    final otherLines = isLeft ? data.linesB : data.linesA;
+    final otherStart = isLeft ? b.rightStart : b.leftStart;
+    final otherEnd = isLeft ? b.rightEnd : b.leftEnd;
+
+    if (b.kind == GroupedBlockKind.equal || end <= start) {
+      return List.generate(end - start, (_) => <int>[], growable: false);
+    }
+    final selfBlob = lines.sublist(start, end).join('\n');
+    final otherBlob = otherLines.sublist(otherStart, otherEnd).join('\n');
+    final onlyWs = b.kind == GroupedBlockKind.equalIgnoringWs;
+    return _hlCached(selfBlob, end - start, otherBlob, onlyWs);
+  }
+
+  void _scheduleProcess() {
+    if (_processing) return;
+    _processing = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _processOne());
+  }
+
+  void _processOne() {
+    if (!mounted) {
+      _processing = false;
+      return;
+    }
+
+    // ★ 按时间预算处理，而非固定任务数：单个重高亮也可能超帧，
+    // 故每帧最多算 ~8ms，超时即让出，下一帧继续。
+    const int budgetUs = 8000;
+    final sw = Stopwatch()..start();
+    var processed = 0;
+
+    while (sw.elapsedMicroseconds < budgetUs) {
+      bool didWork = false;
+
+      if (_pendingHeights.isNotEmpty) {
+        int? target;
+        for (final i in _recentlyVisible) {
+          if (_pendingHeights.contains(i)) {
+            target = i;
+            break;
+          }
+        }
+        target ??= _pendingHeights.first;
+
+        _pendingHeights.remove(target);
+        try {
+          _chunkHeights[target] = _computeHeight(target);
+          // ★ 淘汰旧缓存，防止无限增长
+          if (_chunkHeights.length > _kMaxChunkHeights) {
+            _chunkHeights.remove(_chunkHeights.keys.first);
+          }
+          didWork = true;
+        } catch (_) {}
+      } else if (_pendingHighlights.isNotEmpty) {
+        String? target;
+        for (final i in _recentlyVisible) {
+          for (final suffix in const ['L', 'R']) {
+            final k = '$i:$suffix';
+            if (_pendingHighlights.contains(k)) {
+              target = k;
+              break;
+            }
+          }
+          if (target != null) break;
+        }
+        target ??= _pendingHighlights.first;
+
+        _pendingHighlights.remove(target);
+        try {
+          final parts = target.split(':');
+          final idx = int.parse(parts[0]);
+          final side = parts[1] == 'L' ? _Side.left : _Side.right;
+          _highlightsCache[target] = _computeHighlight(idx, side);
+          // ★ 淘汰旧缓存
+          if (_highlightsCache.length > _kMaxHighlights) {
+            _highlightsCache.remove(_highlightsCache.keys.first);
+          }
+          didWork = true;
+        } catch (_) {}
+      } else {
+        break;
+      }
+
+      if (!didWork) break;
+      processed++;
+    }
+
+    if (processed > 0 && mounted) {
+      setState(() {});
+    }
+
+    if (_pendingHeights.isNotEmpty || _pendingHighlights.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _processOne());
+    } else {
+      _processing = false;
+    }
+  }
+
+  List<GroupedBlock> _filter(List<GroupedBlock> blocks, int ctx) {
+    if (ctx <= 0) {
+      return <GroupedBlock>[
+        for (final b in blocks)
+          if (b.kind != GroupedBlockKind.equal) b,
+      ];
+    }
+    final diffIdx = <int>[];
+    for (var i = 0; i < blocks.length; i++) {
+      if (blocks[i].kind != GroupedBlockKind.equal) diffIdx.add(i);
+    }
+    if (diffIdx.isEmpty) return const [];
+    final keep = <int>{};
+    for (final di in diffIdx) {
+      keep.add(di);
+      var acc = 0;
+      for (var j = di - 1; j >= 0 && acc < ctx; j--) {
+        keep.add(j);
+        final v = blocks[j].visualLength;
+        acc += v == 0 ? 1 : v;
+      }
+      acc = 0;
+      for (var j = di + 1; j < blocks.length && acc < ctx; j++) {
+        keep.add(j);
+        final v = blocks[j].visualLength;
+        acc += v == 0 ? 1 : v;
+      }
+    }
+    final sorted = keep.toList()..sort();
+    return [for (final i in sorted) blocks[i]];
+  }
+}
+
+// ==================== 颜色配置 ====================
+
+class _Colors {
+  const _Colors({
+    required this.diffLeftBg,
+    required this.diffRightBg,
+    required this.charDeleteBg,
+    required this.charDeleteFg,
+    required this.charInsertBg,
+    required this.charInsertFg,
+    required this.equalIgnoringWsBg,
+    required this.wsHighlight,
+    required this.findYellow,
+    required this.findPink,
+  });
+  final Color diffLeftBg, diffRightBg;
+  final Color charDeleteBg, charDeleteFg;
+  final Color charInsertBg, charInsertFg;
+  final Color equalIgnoringWsBg, wsHighlight;
+  final Color findYellow, findPink;
+}
+
+enum _Side { left, right }
+
+// ==================== 单侧块渲染 ====================
+
+class _BlockTile extends StatelessWidget {
+  const _BlockTile({
+    required this.block, required this.data, required this.side,
+    required this.showLineNumbers, required this.bodyFontSize,
+    required this.contextFontSize, required this.gutterFontSize,
+    required this.findQuery, required this.isCurrent,
+    required this.highlights,
+    required this.showShortEndMark,
+    required this.afterShortEnd,
+    required this.colors, required this.onLineLongPress,
+  });
+
+  final GroupedBlock block;
+  final GroupedDiffData data;
+  final _Side side;
+  final bool showLineNumbers;
+  final double bodyFontSize;
+  final double contextFontSize;
+  final double gutterFontSize;
+  final String findQuery;
+  final bool isCurrent;
+  final List<List<int>>? highlights;
+  final bool showShortEndMark;
+  final bool afterShortEnd;
+  final _Colors colors;
+  final void Function(int lineIdx, bool isLeft) onLineLongPress;
+
+  @override
+  Widget build(BuildContext context) {
+    final isLeft = side == _Side.left;
+    final start = isLeft ? block.leftStart : block.rightStart;
+    final end = isLeft ? block.leftEnd : block.rightEnd;
+    final lines = isLeft ? data.linesA : data.linesB;
+
+    final hi = highlights ??
+        List.generate(end - start, (_) => <int>[], growable: false);
+
+    final isContext = block.kind == GroupedBlockKind.equal;
+    final fs = isContext ? contextFontSize : bodyFontSize;
+    final bg = afterShortEnd ? const Color(0xFF1C1C1C) : _bg();
+    final defaultFg = Theme.of(context).textTheme.bodyMedium?.color ??
+        (Theme.of(context).brightness == Brightness.dark
+            ? Colors.white : Colors.black);
+    final fg = afterShortEnd ? const Color(0xFFB0B0B0) : defaultFg;
+    final outline = afterShortEnd
+        ? const Color(0xFF606060)
+        : Theme.of(context).colorScheme.outline;
+    final base = TextStyle(fontSize: fs, color: fg, height: 1.4);
+
+    final bodyStrut = StrutStyle(
+      fontSize: fs,
+      height: 1.4,
+      forceStrutHeight: true,
+    );
+    final gutterStrut = StrutStyle(
+      fontSize: gutterFontSize,
+      height: 1.4,
+      forceStrutHeight: true,
+    );
+
+    final rows = <Widget>[];
+    for (var li = start; li < end; li++) {
+      if (li < 0 || li >= lines.length) continue;
+      final local = li - start;
+      final marks = local >= 0 && local < hi.length
+          ? hi[local].toSet() : <int>{};
+      rows.add(GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onLongPress: () => onLineLongPress(li, isLeft),
+        child: Row(
+          // 行号(小号字)与正文(大号字)字号不同，改用基线对齐，让行号与正文第一行共基线。
+          crossAxisAlignment: CrossAxisAlignment.baseline,
+          textBaseline: TextBaseline.alphabetic,
+          children: [
+            if (showLineNumbers) ...[
+              SizedBox(
+                width: 30,
+                child: Text('${li + 1}',
+                  textAlign: TextAlign.end,
+                  maxLines: 1,
+                  softWrap: false,
+                  overflow: TextOverflow.clip,
+                  strutStyle: gutterStrut,
+                  style: TextStyle(
+                    fontSize: gutterFontSize,
+                    height: 1.4,
+                    color: outline)),
+              ),
+              const SizedBox(width: 4),
+            ],
+            Expanded(child: Text.rich(
+              TextSpan(children: _spans(
+                lines[li], marks, base, findQuery, isCurrent, isLeft)),
+              strutStyle: bodyStrut,
+            )),
+          ],
+        ),
+      ));
+    }
+    if (rows.isEmpty) rows.add(SizedBox(height: fs * 1.4));
+
+    final content = ColoredBox(
+      color: bg,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: rows,
+        ),
+      ),
+    );
+
+    final Widget body = showShortEndMark
+        ? Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              content,
+              Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: const [
+                  _WarningBar(color: Color(0xFFFF0000), label: '短文件到此结束，下方仅为长文件独有内容'),
+                  _WarningBar(color: Color(0xFFFF8700), label: '短文件到此结束，下方仅为长文件独有内容'),
+                  _WarningBar(color: Color(0xFFF9FF00), label: '短文件到此结束，下方仅为长文件独有内容'),
+                  _WarningBar(color: Color(0xFF00FF27), label: '短文件到此结束，下方仅为长文件独有内容'),
+                  _WarningBar(color: Color(0xFF00F3FF), label: '短文件到此结束，下方仅为长文件独有内容'),
+                  _WarningBar(color: Color(0xFF0037FF), label: '短文件到此结束，下方仅为长文件独有内容'),
+                  _WarningBar(color: Color(0xFF9C00FF), label: '短文件到此结束，下方仅为长文件独有内容'),
+                  _WarningBar(color: Color(0xFFFF50DE), label: '短文件到此结束，下方仅为长文件独有内容'),
+                ],
+              ),
+            ],
+          )
+        : content;
+
+    if (isCurrent) {
+      return Container(
+        foregroundDecoration: BoxDecoration(
+          border: Border.all(
+            color: afterShortEnd ? const Color(0xFF606060) : Colors.black,
+            width: 2,
+          ),
+        ),
+        child: body,
+      );
+    }
+    return body;
+  }
+
+  Color _bg() {
+    switch (block.kind) {
+      case GroupedBlockKind.equal:
+        return Colors.transparent;
+      case GroupedBlockKind.equalIgnoringWs:
+        return colors.equalIgnoringWsBg;
+      case GroupedBlockKind.different:
+        return side == _Side.left ? colors.diffLeftBg : colors.diffRightBg;
+    }
+  }
+
+  List<InlineSpan> _spans(
+    String text, Set<int> marks, TextStyle base,
+    String findQuery, bool isCurrent, bool isLeft,
+  ) {
+    final lineEndMarked = marks.contains(text.length);
+    final innerMarks = marks.where((m) => m < text.length).toSet();
+    final out = <InlineSpan>[];
+
+    final diffCharBg = isLeft ? colors.charDeleteBg : colors.charInsertBg;
+    final diffCharFg = isLeft ? colors.charDeleteFg : colors.charInsertFg;
+
+    if (text.isEmpty) {
+      out.add(TextSpan(text: ' ', style: base));
+    } else if (innerMarks.isEmpty) {
+      _appendWithFind(out, text, base, findQuery, isCurrent);
+    } else {
+      var i = 0;
+      while (i < text.length) {
+        final marked = innerMarks.contains(i);
+        var j = i;
+        while (j < text.length && innerMarks.contains(j) == marked) j++;
+        final chunk = text.substring(i, j);
+        if (marked) {
+          final isWs = _isWs(text.codeUnitAt(i));
+          out.add(TextSpan(
+            text: chunk,
+            style: base.copyWith(
+              backgroundColor:
+                  isWs ? colors.wsHighlight : diffCharBg,
+              color: isWs ? base.color : diffCharFg,
+              fontWeight: FontWeight.bold,
+            ),
+          ));
+        } else {
+          _appendWithFind(out, chunk, base, findQuery, isCurrent);
+        }
+        i = j;
+      }
+    }
+
+    if (lineEndMarked) {
+      out.add(TextSpan(
+        text: '↵',
+        style: base.copyWith(
+          backgroundColor: colors.wsHighlight,
+          fontWeight: FontWeight.bold),
+      ));
+    }
+    return out;
+  }
+
+  void _appendWithFind(List<InlineSpan> out, String text, TextStyle base,
+      String q, bool isCurrent) {
+    if (q.isEmpty || !text.contains(q)) {
+      out.add(TextSpan(text: text, style: base));
+      return;
+    }
+    final bg = isCurrent ? colors.findPink : colors.findYellow;
+    var s = 0;
+    int idx;
+    while ((idx = text.indexOf(q, s)) != -1) {
+      if (idx > s) out.add(TextSpan(text: text.substring(s, idx), style: base));
+      out.add(TextSpan(text: q, style: base.copyWith(
+        backgroundColor: bg, fontWeight: FontWeight.bold)));
+      s = idx + q.length;
+    }
+    if (s < text.length) {
+      out.add(TextSpan(text: text.substring(s), style: base));
+    }
+  }
+}
+
+class _WarningBar extends StatelessWidget {
+  const _WarningBar({required this.color, required this.label});
+
+  final Color color;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 18,
+      color: color,
+      alignment: Alignment.center,
+      child: Text(
+        label,
+        style: const TextStyle(
+          fontSize: 10,
+          color: Colors.white,
+          fontWeight: FontWeight.w700,
+          shadows: [Shadow(blurRadius: 2, color: Colors.black)],
+        ),
+      ),
+    );
+  }
+}
+
+// ==================== 跳转指示器 ====================
+
+enum _JumpDirection { up, down }
+
+/// 跳转遮罩用的指示器：呼吸环 + 环上旋转点 + 中心方向箭头。
+class _JumpIndicator extends StatefulWidget {
+  const _JumpIndicator({
+    required this.direction,
+    this.size = 64,
+  });
+
+  final _JumpDirection direction;
+  final double size;
+
+  @override
+  State<_JumpIndicator> createState() => _JumpIndicatorState();
+}
+
+class _JumpIndicatorState extends State<_JumpIndicator>
+    with TickerProviderStateMixin {
+  late final AnimationController _rotation;
+  late final AnimationController _breath;
+
+  @override
+  void initState() {
+    super.initState();
+    _rotation = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 850),
+    )..repeat();
+    _breath = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _rotation.dispose();
+    _breath.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.primary;
+    return SizedBox(
+      width: widget.size,
+      height: widget.size,
+      child: AnimatedBuilder(
+        animation: Listenable.merge([_rotation, _breath]),
+        builder: (_, __) => Stack(
+          alignment: Alignment.center,
+          children: [
+            CustomPaint(
+              size: Size.square(widget.size),
+              painter: _JumpRingPainter(
+                rotation: _rotation.value,
+                breath: _breath.value,
+                color: color,
+              ),
+            ),
+            Icon(
+              widget.direction == _JumpDirection.up
+                  ? Icons.keyboard_double_arrow_up
+                  : Icons.keyboard_double_arrow_down,
+              size: widget.size * 0.38,
+              color: color.withValues(alpha: 0.85),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _JumpRingPainter extends CustomPainter {
+  _JumpRingPainter({
+    required this.rotation,
+    required this.breath,
+    required this.color,
+  });
+
+  final double rotation;
+  final double breath;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = size.center(Offset.zero);
+    final radius = size.width / 2 - 4;
+
+    // 底环（呼吸：透明度 12% ↔ 20%）
+    final bg = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2
+      ..color = color.withValues(alpha: 0.12 + 0.08 * breath);
+    canvas.drawCircle(center, radius, bg);
+
+    // 旋转的点
+    final angle = rotation * 2 * math.pi;
+    final dot = Offset(
+      center.dx + radius * math.cos(angle),
+      center.dy + radius * math.sin(angle),
+    );
+    final dotPaint = Paint()
+      ..color = color
+      ..style = PaintingStyle.fill;
+    canvas.drawCircle(dot, 4, dotPaint);
+
+    // 点后面拖的短弧，让它看起来"在跑"
+    final arcPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.5
+      ..strokeCap = StrokeCap.round
+      ..color = color.withValues(alpha: 0.5);
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius),
+      angle - 0.6,
+      0.6,
+      false,
+      arcPaint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_JumpRingPainter old) =>
+      old.rotation != rotation ||
+      old.breath != breath ||
+      old.color != color;
+}

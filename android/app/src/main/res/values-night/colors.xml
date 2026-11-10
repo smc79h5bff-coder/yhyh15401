@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 启动页柔光渐变（深色） -->
+    <color name="splash_start">#121212</color>
+    <color name="splash_center">#172231</color>
+    <color name="splash_end">#121212</color>
+    <color name="splash_solid">#121212</color>
+</resources>

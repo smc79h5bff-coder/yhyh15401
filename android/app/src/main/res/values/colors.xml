@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 启动页柔光渐变（浅色） -->
+    <color name="splash_start">#FFFFFF</color>
+    <color name="splash_center">#EAF4FF</color>
+    <color name="splash_end">#FFFFFF</color>
+    <!-- Android 12+ 系统闪屏只支持纯色，取渐变中段的近似值 -->
+    <color name="splash_solid">#F5FAFF</color>
+</resources>
